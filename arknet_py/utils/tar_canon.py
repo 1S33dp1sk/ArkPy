@@ -1,4 +1,4 @@
-# tar_canon.py — Canonical TAR (USTAR) builder for deterministic hashing
+# arknet_py/utils/tar_canon.py — Canonical TAR (USTAR) builder for deterministic hashing
 #
 # - Walks a root directory (or a set of include roots)
 # - Excludes common transient dirs/files
@@ -6,8 +6,6 @@
 # - Writes USTAR format with:
 #     uid=gid=0, uname=gname="", mode=0o644, mtime=0
 # - Regular files only (symlinks, devices, dirs are skipped)
-# - Reads file content and embeds as REGTYPE (dereferenced), ensuring parity
-#   across OS filesystems.
 #
 # NOTE: Keep this in sync with C-side canonicalization if you add fields.
 
@@ -19,10 +17,15 @@ import tarfile
 from typing import Callable, Iterable, List, Optional, Sequence, Set, Tuple
 
 __all__ = [
+    # defaults (compat)
+    "DEFAULT_INCLUDE",
+    "DEFAULT_EXCLUDE",
     "DEFAULT_EXCLUDES",
+    # core
     "iter_files",
     "canonical_arcname",
     "build_canonical_tar_bytes",
+    "canonical_tar_bytes",   # compat alias
     "write_canonical_tar",
 ]
 
@@ -32,8 +35,14 @@ DEFAULT_EXCLUDES: Set[str] = {
     ".DS_Store", "__pycache__", ".pytest_cache",
     ".ipynb_checkpoints",
     "venv", ".venv", "env", ".mypy_cache",
-    "node_modules",
+    "node_modules", "commit.json",
+    # Arknet-specific: do not include metadata in identity
+    "env.json",        # machine snapshot – varies across runs/machines
+    "commit.json",     # written after hashing; not part of the commit preimage
 }
+# Compat names used elsewhere in the project
+DEFAULT_INCLUDE: Sequence[str] = (".",)
+DEFAULT_EXCLUDE: Set[str] = set(DEFAULT_EXCLUDES)
 
 # Optional: allow callers to further filter paths (return True to KEEP file)
 PathFilter = Callable[[str], bool]
@@ -118,7 +127,7 @@ def build_canonical_tar_bytes(
     """
     Return USTAR bytes of a canonical archive containing files under root (or includes).
     """
-    roots = [os.path.join(root, p) if includes else root for p in (includes or ["."])]
+    roots = [os.path.join(root, p) if includes else root for p in (includes or (".",))]
     # Collect and sort by arcname
     files: List[Tuple[str, str, str]] = []  # (root, full, arc)
     for r, full in iter_files(roots, excludes=excludes, filter_fn=filter_fn):
@@ -133,6 +142,25 @@ def build_canonical_tar_bytes(
             with open(full, "rb") as f:
                 tf.addfile(ti, f)
     return buf.getvalue()
+
+
+# ---------------- compatibility alias ----------------
+
+def canonical_tar_bytes(
+    root: str,
+    *,
+    include: Optional[Sequence[str]] = None,
+    exclude: Optional[Iterable[str]] = None,
+    filter_fn: Optional[PathFilter] = None,
+) -> bytes:
+    """
+    Compat wrapper for older call sites:
+      canonical_tar_bytes(root, include=..., exclude=..., filter_fn=...)
+    maps to build_canonical_tar_bytes(root, includes=..., excludes=...).
+    """
+    inc = include if include is not None else DEFAULT_INCLUDE
+    exc = set(exclude) if exclude is not None else DEFAULT_EXCLUDE
+    return build_canonical_tar_bytes(root, includes=inc, excludes=exc, filter_fn=filter_fn)
 
 
 def write_canonical_tar(

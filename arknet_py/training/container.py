@@ -1,16 +1,13 @@
-# training/container.py — environment snapshot + deterministic digest
+# arknet_py/training/container.py — environment snapshot + deterministic digest
 from __future__ import annotations
 
-import json
 import os
 import platform
-import shutil
-import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
-try:
+try:    # optional deps
     import torch  # type: ignore
 except Exception:  # pragma: no cover
     torch = None  # type: ignore
@@ -22,156 +19,139 @@ except Exception:  # pragma: no cover
 
 from ..utils.json_canon import dumps_canon
 from ..utils.hashing import sha256_domain_hex
+from ..utils.iohelpers import atomic_write, ensure_dir
 
+__all__ = ["write_environment_snapshot", "snapshot_environment"]
 
 _ENV_DOMAIN = b"ARK/ENV/SNAPSHOT/v1\n"
 
 # Determinism-relevant env keys we record verbatim (if set)
-DETERMINISM_ENV_KEYS = [
+_DETERMINISM_ENV_KEYS = [
     "PYTHONHASHSEED",
     "CUBLAS_WORKSPACE_CONFIG",
     "NVIDIA_TF32_OVERRIDE",
     "CUDA_VISIBLE_DEVICES",
     "PYTORCH_CUDA_ALLOC_CONF",
-    "TF32",  # generic flag some users set
 ]
-
-# Minimal pinned-package list (add more if you like)
-PINNED_PKGS = ["torch", "numpy", "safetensors"]
-
 
 @dataclass
 class GpuInfo:
-    index: int
     name: str
     capability: Optional[str]
     total_memory_mb: Optional[int]
 
-
 @dataclass
 class TorchInfo:
     version: Optional[str]
-    cuda: Optional[str]
-    cudnn: Optional[str]
-    gpu_list: List[GpuInfo]
-
+    cuda_version: Optional[str]
+    cudnn: Optional[Dict[str, Any]]
+    gpus: List[GpuInfo]
 
 @dataclass
 class EnvSnapshot:
     python: str
-    python_exe: str
-    platform: str
-    uname: str
-    pip_freeze: Dict[str, str]
-    torch: TorchInfo
+    platform: Dict[str, str]               # {system, release, machine}
+    numpy: Optional[str]
+    torch: Optional[TorchInfo]
     determinism_env: Dict[str, str]
-    nvidia_smi: Optional[str]  # first line parse or None
+    allow_tf32: bool
 
-    def to_json(self) -> str:
-        # Ensure dataclasses nested conversion
-        d = asdict(self)
-        return dumps_canon(d)
+    def to_canon_json(self) -> str:
+        # dataclasses → dict → canonical JSON (sorted keys, minimal whitespace)
+        return dumps_canon(asdict(self))
 
     def commit_hex(self) -> str:
-        return sha256_domain_hex(_ENV_DOMAIN, self.to_json().encode("utf-8"))
+        text = self.to_canon_json()
+        # Domain-separated digest; keep arg order consistent with repo usage
+        return sha256_domain_hex(_ENV_DOMAIN, text.encode("utf-8"))
 
+# -------- collectors (stable only; no paths/hostnames/timestamps) ----------
 
-# ---- collectors -----------------------------------------------------------
+def _collect_platform() -> Dict[str, str]:
+    return {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+    }
 
-def _collect_pip_freeze(target: List[str]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for name in target:
-        try:
-            mod = __import__(name)
-            ver = getattr(mod, "__version__", None)
-            if ver:
-                out[name] = str(ver)
-        except Exception:
-            pass
-    return out
+def _collect_torch(allow_tf32: bool) -> Optional[TorchInfo]:
+    if torch is None:
+        return None
 
+    version = getattr(torch, "__version__", None)
+    cuda_ver = getattr(torch.version, "cuda", None) if hasattr(torch, "version") else None
 
-def _collect_torch() -> TorchInfo:
-    gpu_list: List[GpuInfo] = []
-    version = getattr(torch, "__version__", None) if torch else None
-    cuda = torch.version.cuda if (torch and hasattr(torch, "version") and hasattr(torch.version, "cuda")) else None
-    cudnn = None
-    if torch and hasattr(torch.backends, "cudnn"):
-        try:
-            cudnn = str(torch.backends.cudnn.version())  # type: ignore
-        except Exception:
-            cudnn = None
+    cudnn_info: Optional[Dict[str, Any]] = None
+    try:
+        if hasattr(torch.backends, "cudnn"):
+            cudnn_info = {
+                "enabled": bool(torch.backends.cudnn.enabled),
+                "version": getattr(torch.backends.cudnn, "version", None),
+                "deterministic": getattr(torch.backends.cudnn, "deterministic", None),
+                "benchmark": getattr(torch.backends.cudnn, "benchmark", None),
+            }
+    except Exception:
+        cudnn_info = None
 
-    if torch and torch.cuda.is_available():
-        try:
-            n = torch.cuda.device_count()
-            for i in range(n):
-                name = torch.cuda.get_device_name(i)
-                cap = None
+    gpus: List[GpuInfo] = []
+    try:
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
                 try:
-                    major, minor = torch.cuda.get_device_capability(i)
-                    cap = f"{major}.{minor}"
+                    name = str(torch.cuda.get_device_name(i))
+                except Exception:
+                    name = f"cuda:{i}"
+                capability: Optional[str] = None
+                try:
+                    maj, minr = torch.cuda.get_device_capability(i)
+                    capability = f"{maj}.{minr}"
                 except Exception:
                     pass
-                mem_mb = None
+                mem_mb: Optional[int] = None
                 try:
                     props = torch.cuda.get_device_properties(i)
                     mem_mb = int(getattr(props, "total_memory", 0) // (1024 * 1024))
                 except Exception:
                     pass
-                gpu_list.append(GpuInfo(index=i, name=name, capability=cap, total_memory_mb=mem_mb))
-        except Exception:
-            pass
-
-    return TorchInfo(version=version, cuda=cuda, cudnn=cudnn, gpu_list=gpu_list)
-
-
-def _collect_nvidia_smi() -> Optional[str]:
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return None
-    try:
-        out = subprocess.check_output([exe, "-q"], stderr=subprocess.STDOUT, timeout=2)
-        # Return just the first non-empty line for stability
-        for line in out.decode("utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if line:
-                return line[:200]
-        return None
+                gpus.append(GpuInfo(name=name, capability=capability, total_memory_mb=mem_mb))
     except Exception:
-        return None
+        # leave gpus empty
+        pass
 
+    return TorchInfo(
+        version=version,
+        cuda_version=cuda_ver,
+        cudnn=cudnn_info,
+        gpus=sorted(gpus, key=lambda x: (x.name or "", x.capability or "", x.total_memory_mb or -1)),
+    )
 
-def snapshot_environment() -> EnvSnapshot:
-    determinism_env: Dict[str, str] = {}
-    for k in DETERMINISM_ENV_KEYS:
+def _collect_determinism_env() -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k in _DETERMINISM_ENV_KEYS:
         v = os.environ.get(k)
         if v is not None:
-            determinism_env[k] = str(v)
+            out[k] = str(v)
+    return out
 
-    snap = EnvSnapshot(
-        python=sys.version.split()[0],
-        python_exe=sys.executable,
-        platform=platform.platform(),
-        uname=" ".join(platform.uname()),
-        pip_freeze=_collect_pip_freeze(PINNED_PKGS),
-        torch=_collect_torch(),
-        determinism_env=determinism_env,
-        nvidia_smi=_collect_nvidia_smi(),
+# -------- public API -------------------------------------------------------
+
+def snapshot_environment(*, allow_tf32: bool = False) -> EnvSnapshot:
+    return EnvSnapshot(
+        python=".".join(map(str, sys.version_info[:3])),
+        platform=_collect_platform(),
+        numpy=(getattr(np, "__version__", None) if np is not None else None),
+        torch=_collect_torch(allow_tf32),
+        determinism_env=_collect_determinism_env(),
+        allow_tf32=bool(allow_tf32),
     )
-    return snap
 
-
-# ---- convenience ----------------------------------------------------------
-
-def write_environment_snapshot(out_dir: str) -> str:
+def write_environment_snapshot(out_dir: str, *, allow_tf32: bool = False) -> str:
     """
-    Write env.json to `out_dir` (created if needed). Return commit hex.
+    Write env.json (canonical JSON) into `out_dir` and return its commit hex.
+    This snapshot intentionally excludes volatile fields (paths, cwd, hostnames, time).
     """
-    os.makedirs(out_dir, exist_ok=True)
-    snap = snapshot_environment()
-    j = snap.to_json()
-    with open(os.path.join(out_dir, "env.json"), "w", encoding="utf-8") as f:
-        f.write(j)
-        f.write("\n")
+    ensure_dir(out_dir)
+    snap = snapshot_environment(allow_tf32=allow_tf32)
+    text = snap.to_canon_json()
+    atomic_write(os.path.join(out_dir, "env.json"), text.encode("utf-8"))
     return snap.commit_hex()

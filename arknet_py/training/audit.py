@@ -14,20 +14,21 @@ except Exception:  # pragma: no cover
     np = None  # type: ignore
 
 from ..utils.json_canon import dumps_canon
-from ..utils.hashing import sha256_domain_hex
+from ..utils.hashing import domain_hash_hex
 from ..determinism import apply_determinism_profile
 from ..commit import compute_commit as compute_artifact_commit
 
-
 _AUDIT_DOMAIN = b"ARK/AUDIT/REPORT/v1\n"
 
+
+# --------------------------- datamodel --------------------------------------
 
 @dataclass
 class AuditSampleResult:
     index: int                # leaf index in transcript
     kind: str                 # e.g., "train_step"
     ok: bool
-    checks: Dict[str, bool]   # per-check booleans (e.g., pre_commit, dataset, post_commit, grads)
+    checks: Dict[str, bool]   # per-check booleans (e.g., parent_commit_ok, dataset_commit_ok, pre/post)
     metrics: Dict[str, float] # numeric drift metrics (e.g., max_abs, max_rel)
     notes: List[str]
 
@@ -48,10 +49,10 @@ class AuditReport:
         return dumps_canon(asdict(self))
 
     def commit_hex(self) -> str:
-        return sha256_domain_hex(_AUDIT_DOMAIN, self.to_json().encode("utf-8"))
+        return domain_hash_hex(self.to_json().encode("utf-8"), _AUDIT_DOMAIN)
 
 
-# ---- internal helpers -----------------------------------------------------
+# --------------------------- helpers ----------------------------------------
 
 def _load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -90,18 +91,18 @@ def _within_tol(a: float, b: float, tol: float) -> bool:
 def _drift_metrics(a: "np.ndarray", b: "np.ndarray") -> Tuple[float, float]:
     if np is None:
         return (0.0, 0.0)
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    diff = np.abs(a - b)
+    aa = np.asarray(a, dtype=np.float64)
+    bb = np.asarray(b, dtype=np.float64)
+    diff = np.abs(aa - bb)
     max_abs = float(diff.max() if diff.size else 0.0)
-    denom = np.maximum(np.abs(a), np.abs(b))
+    denom = np.maximum(np.abs(aa), np.abs(bb))
     denom[denom == 0.0] = 1.0
     rel = diff / denom
     max_rel = float(rel.max() if rel.size else 0.0)
     return (max_abs, max_rel)
 
 
-# ---- public API -----------------------------------------------------------
+# ----------------------------- public API -----------------------------------
 
 def audit_transcript(
     artifact_dir: str,
@@ -115,26 +116,51 @@ def audit_transcript(
 ) -> AuditReport:
     """
     Recompute K sampled leaves from `transcript_path` using artifact’s trainer if available.
-    - If trainer.recompute_step() is not present, performs a *light audit*:
-        * checks artifact commit matches leaf,
-        * validates dataset commit equality,
-        * validates post-commit equals pre-commit when leaf says "no-op".
-    Returns a deterministic AuditReport with its own commit hex.
+
+    Transcript format (from new trainer):
+      {
+        "header": {
+          "spec": {...},
+          "parent_commit": "...",
+          "env_commit": "...",
+          "steps": N,
+          "dataset_commit": "..."
+        },
+        "leaves": [ { "kind":"train_step", "index":0, "pre_commit":..., "post_commit":..., "loss":..., "dataset_commit":..., "batch": {...}, "tags":[...] }, ... ],
+        "root": "...",
+        "domain": "ARK/TRAIN/TRANSCRIPT/v1"
+      }
+
+    Deep audit path (if artifact trainer exposes recompute_step):
+      - Calls trainer.recompute_step(artifact_dir, job_spec_dict, leaf_dict, tolerance)
+      - Consumes booleans like pre_commit_ok/post_commit_ok and numeric metrics.
+
+    Light audit fallback:
+      - Checks parent_commit == computed artifact commit (per sample)
+      - Checks leaf.dataset_commit == header.dataset_commit (if present)
+      - If leaf has tag "noop", verifies pre_commit == post_commit
     """
     if apply_determinism:
         apply_determinism_profile(seed=seed)
 
     tr = _load_json(transcript_path)
+    header: Dict[str, Any] = dict(tr.get("header") or {})
     leaves: List[Dict[str, Any]] = list(tr.get("leaves") or [])
     total = len(leaves)
 
-    job_spec: Dict[str, Any] = _load_json(spec_path) if spec_path else (tr.get("job_spec") or {})
+    # Spec to provide to recompute (prefer explicit file; else header.spec)
+    if spec_path:
+        job_spec: Dict[str, Any] = _load_json(spec_path)
+    else:
+        job_spec = dict(header.get("spec") or {})
+
+    # Commit of the artifact currently on disk (should match header.parent_commit)
     artifact_commit_hex, _ = compute_artifact_commit(artifact_dir)
 
-    # Trainer hook (deep audit) if available
+    # Optional deep-audit hook from artifact
     recompute_step = _import_trainer_recompute(artifact_dir)
 
-    # sample indices
+    # Which leaves to audit
     chosen = _select_indices(total, k, seed)
 
     results: List[AuditSampleResult] = []
@@ -146,39 +172,39 @@ def audit_transcript(
         notes: List[str] = []
         ok = True
 
-        # Always check artifact commit if present in leaf
-        leaf_art_commit = leaf.get("artifact_commit")
-        if leaf_art_commit is not None:
-            same = (str(leaf_art_commit) == artifact_commit_hex)
-            checks["artifact_commit"] = same
-            ok = ok and same
-            if not same:
-                notes.append("artifact_commit mismatch")
+        # Parent commit (header vs computed)
+        parent_commit = header.get("parent_commit")
+        if parent_commit is not None:
+            same_parent = (str(parent_commit) == str(artifact_commit_hex))
+            checks["parent_commit_ok"] = same_parent
+            ok = ok and same_parent
+            if not same_parent:
+                notes.append("parent_commit != compute_commit(artifact_dir)")
 
-        # dataset commit equality if both sides provide it
-        if "dataset_commit" in leaf and "dataset_commit" in job_spec:
-            dc_same = (str(leaf["dataset_commit"]) == str(job_spec["dataset_commit"]))
-            checks["dataset_commit"] = dc_same
+        # Dataset commit (leaf vs header)
+        if "dataset_commit" in leaf and "dataset_commit" in header:
+            dc_same = (str(leaf["dataset_commit"]) == str(header["dataset_commit"]))
+            checks["dataset_commit_ok"] = dc_same
             ok = ok and dc_same
             if not dc_same:
-                notes.append("dataset_commit mismatch")
+                notes.append("leaf.dataset_commit != header.dataset_commit")
 
         if recompute_step and kind in ("train_step", "opt_step", "sgd_step", "adamw_step"):
             try:
                 rc = recompute_step(artifact_dir, job_spec, leaf, float(tolerance))
-                # expected keys:
-                #   rc["pre_commit_ok"], rc["post_commit_ok"]
-                #   rc.get("max_abs"), rc.get("max_rel")
-                #   rc.get("optimizer_ok"), rc.get("batch_ok")
+                # Booleans
                 for key in ("pre_commit_ok", "post_commit_ok", "optimizer_ok", "batch_ok"):
                     if key in rc:
-                        checks[key] = bool(rc[key])
-                        ok = ok and bool(rc[key])
+                        val = bool(rc[key])
+                        checks[key] = val
+                        ok = ok and val
+                # Metrics
                 for key in ("max_abs", "max_rel"):
                     if key in rc and rc[key] is not None:
                         metrics[key] = float(rc[key])
-                if "notes" in rc and isinstance(rc["notes"], list):
-                    notes.extend([str(n) for n in rc["notes"]])
+                # Notes
+                if isinstance(rc.get("notes"), list):
+                    notes.extend(str(n) for n in rc["notes"])
             except Exception as e:  # pragma: no cover
                 ok = False
                 checks["recompute_exception"] = False
@@ -187,7 +213,8 @@ def audit_transcript(
             # Light audit fallback
             pre_c = leaf.get("pre_commit")
             post_c = leaf.get("post_commit")
-            if pre_c is not None and post_c is not None and "noop" in (leaf.get("tags") or []):
+            tags = leaf.get("tags") or []
+            if pre_c is not None and post_c is not None and "noop" in tags:
                 same = (str(pre_c) == str(post_c))
                 checks["noop_commit_equal"] = same
                 ok = ok and same
@@ -197,7 +224,12 @@ def audit_transcript(
                 notes.append("light audit only (no trainer.recompute_step)")
 
         results.append(AuditSampleResult(
-            index=idx, kind=kind, ok=ok, checks=checks, metrics=metrics, notes=notes
+            index=int(idx),
+            kind=kind,
+            ok=bool(ok),
+            checks=checks,
+            metrics=metrics,
+            notes=notes,
         ))
 
     overall_ok = all(r.ok for r in results)

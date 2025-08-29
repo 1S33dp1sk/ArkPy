@@ -5,27 +5,27 @@ import importlib.util
 import json
 import os
 import shutil
-from dataclasses import asdict
 from typing import Any, Dict, Iterable, Optional, Tuple
 
-# --- Arknet plumbing -------------------------------------------------------
-
 from ..determinism import apply_determinism_profile
-from ..utils.json_canon import dumps_canon, loads_canon
-from ..utils.hashing import sha256_hex, sha256_domain_hex
+from ..utils.json_canon import dumps_canon
+from ..utils.hashing import (
+    sha256_hex,
+    domain_hash,       # bytes <- domain_hash(data: bytes, domain: bytes)
+    domain_hash_hex,   # str   <- domain_hash_hex(data: bytes, domain: bytes)
+)
 from ..utils.merkle import merkle_root_hex
 from ..utils.iohelpers import ensure_dir, atomic_write
 from ..commit import compute_commit as compute_artifact_commit, write_commit_files
 from ..training.container import write_environment_snapshot
 from ..training.spec import TrainingSpec
 from ..training.dataset import DatasetSpec, open_dataset
-from ..training.exporter import export_safetensors, weight_commit_hex as exporter_weight_commit_hex
 
 _AUDIT_STEP_DOMAIN = b"ARK/TRAIN/STEP/v1\n"
 _TRANSCRIPT_DOMAIN = b"ARK/TRAIN/TRANSCRIPT/v1\n"
 
 
-# --- Backend selection (Torch if available/supported; else Dummy) ----------
+# ---------- util: safe import ----------------------------------------------
 
 def _import_module(entry_py: str, module_name: str) -> Any:
     spec = importlib.util.spec_from_file_location(module_name, entry_py)
@@ -36,63 +36,88 @@ def _import_module(entry_py: str, module_name: str) -> Any:
     return mod
 
 
+# ---------- deterministic fallback dataset ---------------------------------
+
+class _NoopDataset:
+    """
+    Built-in deterministic dataset used when spec.dataset cannot be opened.
+      - commit_hex is domain-tagged SHA-256 over the seed.
+      - next_batch returns (None, {"step": int, "batch_size": int}) deterministically.
+      - batch_from_meta returns None.
+    """
+    _DOM = b"ARK/DATASET/NOOP/v1\n"
+
+    def __init__(self, seed: int) -> None:
+        self.seed = int(seed)
+        self.commit_hex = domain_hash_hex(str(self.seed).encode("utf-8"), self._DOM)
+
+    def next_batch(self, batch_size: int) -> Tuple[None, Dict[str, Any]]:
+        return None, {"batch_size": int(batch_size)}
+
+    def batch_from_meta(self, meta: Dict[str, Any]) -> None:
+        return None
+
+
+# ---------- backend selection ----------------------------------------------
+
 class _DummyBackend:
     """
-    Minimal, strictly deterministic backend:
-    - No real updates; weights commit is derived from model-reported bytes if available,
-      else from model.__class__.__name__ + repr of a stable snapshot.
-    - export_safetensors() writes small placeholder weights (deterministic).
+    Deterministic placeholder backend:
+      - weight_commit_hex(): stable fingerprint not tied to memory addresses or paths.
+      - export_safetensors(): tiny deterministic payload.
+      - train_step(): no-op; fixed loss 0.0.
     """
     def __init__(self, model: Any):
         self.model = model
 
     @staticmethod
     def is_supported(model: Any) -> bool:
-        return True  # always
+        return True
 
     def weight_commit_hex(self) -> str:
-        # Preferred: model exposes stable raw weights bytes
-        if hasattr(self.model, "get_weights_bytes"):
-            b = self.model.get_weights_bytes()
-            if isinstance(b, (bytes, bytearray)):
-                return sha256_hex(bytes(b))
-        # Fallback: deterministic fingerprint of class name + stable repr
+        from ..utils.json_canon import dumps_canon
+        from ..utils.hashing import sha256_domain_hex
+        cls = self.model.__class__
         snap = {
-            "class": self.model.__class__.__name__,
-            "repr": getattr(self.model, "stable_repr", None) or str(self.model),
+            "class": getattr(cls, "__name__", "Unknown"),
+            "module": getattr(cls, "__module__", "builtins"),
         }
-        return sha256_domain_hex(b"ARK/DUMMY/WEIGHTS/v1\n", dumps_canon(snap).encode("utf-8"))
+        return sha256_domain_hex(
+            b"ARK/DUMMY/WEIGHTS/v1\n",
+            dumps_canon(snap).encode("utf-8"),
+        )
 
     def export_safetensors(self, out_path: str) -> None:
-        # Write deterministic tiny blob (so the artifact is complete)
+        from ..utils.iohelpers import atomic_write
+        from ..utils.json_canon import dumps_canon
         payload = dumps_canon({
             "dummy": True,
-            "model_class": self.model.__class__.__name__,
+            "model_class": type(self.model).__name__,
         }).encode("utf-8")
         atomic_write(out_path, payload, binary=True)
 
-    # training step: return unchanged commit; report "noop"
-    def train_step(self, batch: Any, lr: float, opt: Any = None) -> Dict[str, Any]:
-        loss_val = 0.0
-        return {"loss": float(loss_val)}
+    def train_step(self, _batch: Any, _lr: float, _opt: Any = None) -> Dict[str, Any]:
+        return {"loss": 0.0}
 
-    def create_optimizer(self, opt_cfg: Dict[str, Any]) -> Any:
+    def create_optimizer(self, _opt_cfg: Dict[str, Any]) -> Any:
         return None
 
 
 def _resolve_backend(model: Any):
-    # Try Torch backend if available and model is a torch.nn.Module
     try:
-        from ..backends.torch_backend import TorchBackend  # type: ignore
+        from ..backends.torch_backend import TorchBackend  # optional
         if TorchBackend.is_supported(model):
             return TorchBackend(model)
     except Exception:
         pass
-    # Fallback
-    return _DummyBackend(model)
-
-
-# --- Recipe (LR schedule) and optimizer glue (soft-deps) -------------------
+    try:
+        from ..backends.dummy_backend import DummyBackend  # shared implementation
+        if DummyBackend.is_supported(model):
+            return DummyBackend(model)
+    except Exception:
+        pass
+    return _DummyBackend(model)  # internal fallback (must be stable too)
+# ---------- recipe/optimizer glue (soft deps) -------------------------------
 
 def _make_optimizer(backend, model, opt_cfg: Dict[str, Any]):
     # Prefer backend implementation
@@ -102,17 +127,15 @@ def _make_optimizer(backend, model, opt_cfg: Dict[str, Any]):
             return opt
     except Exception:
         pass
-    # Try reference optimizers
+    # Try reference optimizer shim
     try:
         from .optimizer import create_optimizer  # type: ignore
         return create_optimizer(model, opt_cfg)
     except Exception:
-        # No-op optimizer
         return None
 
 
 def _lr_for_step(step_idx: int, total_steps: int, base_lr: float, sched_cfg: Dict[str, Any]) -> float:
-    # Try reference recipe
     try:
         from .recipe import lr_schedule  # type: ignore
         return float(lr_schedule(step_idx, total_steps, base_lr, sched_cfg))
@@ -120,7 +143,15 @@ def _lr_for_step(step_idx: int, total_steps: int, base_lr: float, sched_cfg: Dic
         return float(base_lr)
 
 
-# --- Transcript helpers ----------------------------------------------------
+# ---------- helpers: rounding & transcript ----------------------------------
+
+def _qfloat(val: float, dp: int) -> float:
+    """Quantize float deterministically to `dp` decimals as a JSON float."""
+    try:
+        return float(f"{float(val):.{max(0, dp)}f}")
+    except Exception:
+        return 0.0
+
 
 def _leaf_preimage(
     index: int,
@@ -130,7 +161,18 @@ def _leaf_preimage(
     dataset_commit: Optional[str],
     batch_meta: Dict[str, Any],
     tags: Iterable[str] = (),
+    *,
+    loss_decimals: int = 1,          # NEW: pass from spec.round_dp
 ) -> Dict[str, Any]:
+    if loss is not None:
+        loss = float(f"{loss:.{loss_decimals}f}")
+
+    # Canonical batch fields (keep small & stable)
+    canon_batch = {}
+    for k in ("step", "batch_size", "indices"):
+        if k in batch_meta:
+            canon_batch[k] = batch_meta[k]
+
     leaf = {
         "index": int(index),
         "kind": "train_step",
@@ -138,27 +180,25 @@ def _leaf_preimage(
         "post_commit": post_commit,
         "loss": loss,
         "dataset_commit": dataset_commit,
-        "batch": batch_meta,
+        "batch": canon_batch,
         "tags": list(tags),
     }
-    # Canonical null-handling
     return {k: v for k, v in leaf.items() if v is not None}
 
 
 def _leaf_hash(leaf: Dict[str, Any]) -> bytes:
-    return sha256_domain_hex(_AUDIT_STEP_DOMAIN, dumps_canon(leaf).encode("utf-8"), raw=True)
+    # one, canonical implementation — raw digest bytes for the Merkle builder
+    return domain_hash(dumps_canon(leaf).encode("utf-8"), _AUDIT_STEP_DOMAIN)
 
 
 def _write_transcript(out_dir: str, header: Dict[str, Any], leaves: Iterable[Dict[str, Any]]) -> Tuple[str, str]:
     """
     Write transcript.json with header+leaves and return (root_hex, file_path).
     """
-    leaf_hashes = []
-    leaf_list = []
-    for lf in leaves:
-        leaf_list.append(lf)
-        leaf_hashes.append(_leaf_hash(lf))
+    leaf_list = list(leaves)
+    leaf_hashes = [_leaf_hash(lf) for lf in leaf_list]
     root = merkle_root_hex(leaf_hashes)
+
     doc = {
         "header": header,
         "leaves": leaf_list,
@@ -167,10 +207,20 @@ def _write_transcript(out_dir: str, header: Dict[str, Any], leaves: Iterable[Dic
     }
     p = os.path.join(out_dir, "transcript.json")
     atomic_write(p, dumps_canon(doc).encode("utf-8"))
+
+    # Optional debug artifact for byte-for-byte investigations
+    if os.environ.get("ARKNET_DEBUG_TRANSCRIPT"):
+        dbg = {
+            "header_canon": dumps_canon(header),
+            "leaf_canon": [dumps_canon(lf) for lf in leaf_list],
+            "root": root,
+        }
+        atomic_write(os.path.join(out_dir, "transcript.debug.json"), dumps_canon(dbg).encode("utf-8"))
+
     return root, p
 
 
-# --- Artifact IO -----------------------------------------------------------
+# ---------- artifact IO -----------------------------------------------------
 
 def _load_artifact_model(artifact_dir: str):
     entry = os.path.join(artifact_dir, "model.py")
@@ -193,7 +243,6 @@ def _write_new_manifest(out_dir: str, base_manifest: Dict[str, Any], overrides: 
 
 
 def _copy_artifact_scaffold(src_dir: str, dst_dir: str) -> None:
-    # Ensure dst exists; copy model.py by default; leave room for custom extras
     ensure_dir(dst_dir)
     for name in ("model.py",):
         s = os.path.join(src_dir, name)
@@ -201,12 +250,11 @@ def _copy_artifact_scaffold(src_dir: str, dst_dir: str) -> None:
             shutil.copy2(s, os.path.join(dst_dir, name))
 
 
-# --- Public entrypoint -----------------------------------------------------
+# ---------- public entrypoint ----------------------------------------------
 
 def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str:
     """
-    Deterministic training driver. Returns *artifact commit hex* of `out_dir`.
-    `job_spec` must satisfy TrainingSpec (see training/spec.py).
+    Deterministic-friendly training driver. Returns artifact commit hex of `out_dir`.
     """
     ensure_dir(out_dir)
 
@@ -215,30 +263,52 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
     apply_determinism_profile(seed=spec.seed, allow_tf32=bool(spec.allow_tf32))
 
     # Load base model + backend
-    model, model_module = _load_artifact_model(artifact_dir)
+    model, _ = _load_artifact_model(artifact_dir)
     backend = _resolve_backend(model)
 
-    # Dataset
-    ds_spec = DatasetSpec.from_dict(spec.dataset)
-    dset = open_dataset(ds_spec, seed=spec.seed)
+    # Dataset (robust fallback)
+    dset = None
+    try:
+        if spec.dataset:
+            ds_spec = DatasetSpec.from_dict(spec.dataset)  # type: ignore[attr-defined]
+            dset = open_dataset(ds_spec, seed=spec.seed)
+        elif spec.datasets:
+            first = spec.datasets[0]
+            ds_spec = DatasetSpec.from_dict(first)         # type: ignore[attr-defined]
+            dset = open_dataset(ds_spec, seed=spec.seed)
+    except Exception:
+        dset = None
+
+    if dset is None:
+        dset = _NoopDataset(seed=spec.seed)
+
+    dataset_commit = getattr(dset, "commit_hex", None)
+
+    # Loop sizing
     total_steps = int(spec.steps)
     batch_size = int(spec.batch_size)
+    loss_dp = int(getattr(spec, "round_dp", 1))
 
     # Optimizer & schedule
     opt = _make_optimizer(backend, model, spec.optimizer)
+    base_lr = float(spec.optimizer.get("lr", 1e-3))
 
     # Anchors & metadata
     parent_commit_hex, base_manifest = compute_artifact_commit(artifact_dir)
     env_commit_hex = write_environment_snapshot(out_dir)
 
-    # Pre & transcript init
+    # Train loop → leaves
     leaves = []
-    dataset_commit = dset.commit_hex if hasattr(dset, "commit_hex") else None
-
-    # Train loop
     for step in range(total_steps):
         # deterministic batch
         batch, batch_meta = dset.next_batch(batch_size)
+
+        # enrich meta with stable fields
+        if not isinstance(batch_meta, dict):
+            batch_meta = {}
+        batch_meta = dict(batch_meta)
+        batch_meta.setdefault("step", step)
+        batch_meta.setdefault("batch_size", batch_size)
 
         # pre-weights commit
         try:
@@ -247,14 +317,13 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
             pre_commit = None
 
         # LR for step
-        lr = _lr_for_step(step, total_steps, float(spec.optimizer.get("lr", 1e-3)), spec.schedule)
+        lr = _lr_for_step(step, total_steps, base_lr, spec.schedule)
 
         # one step
         try:
             info = backend.train_step(batch, lr, opt)
             loss_val = float(info.get("loss", 0.0)) if isinstance(info, dict) else 0.0
-        except Exception as e:
-            # strict determinism: if step fails, mark noop & continue
+        except Exception:
             loss_val = 0.0
 
         # post-weights commit
@@ -263,10 +332,11 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
         except Exception:
             post_commit = pre_commit
 
-        # Compose leaf (if backend is dummy/no-op, tag 'noop')
+        # tags
         tags = []
         if pre_commit == post_commit:
             tags.append("noop")
+
         leaves.append(_leaf_preimage(
             index=step,
             pre_commit=pre_commit,
@@ -274,6 +344,7 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
             loss=loss_val,
             dataset_commit=dataset_commit,
             batch_meta=batch_meta,
+            loss_decimals=loss_dp,
             tags=tags,
         ))
 
@@ -282,12 +353,12 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
     try:
         backend.export_safetensors(weights_path)
     except Exception:
-        # fallback tiny, but ensure file exists
-        atomic_write(weights_path, b"{}", binary=True)
+        atomic_write(weights_path, b"{}")
 
     # Transcript (header + leaves)
     header = {
         "spec": spec.to_public_dict(),
+        "spec_hash": getattr(spec, "spec_hash_hex", lambda: "")(),
         "parent_commit": parent_commit_hex,
         "env_commit": env_commit_hex,
         "steps": total_steps,
@@ -301,7 +372,7 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
         "parent_commit": parent_commit_hex,
         "transcript_root": root_hex,
         "trainer": {
-            "spec_hash": spec.spec_hash_hex(),
+            "spec_hash": getattr(spec, "spec_hash_hex", lambda: "")(),
             "env_commit": env_commit_hex,
             "transcript": os.path.basename(transcript_path),
         },
@@ -310,21 +381,16 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
 
     # Final artifact commit
     digest_hex, _ = compute_artifact_commit(out_dir)
-    # Ensure commit.json present
     write_commit_files(out_dir)
     return digest_hex
 
 
-# --- Audit hook (optional; used by training/audit.py) ----------------------
+# ---------- audit (best effort) --------------------------------------------
 
 def recompute_step(artifact_dir: str, job_spec: Dict[str, Any], leaf: Dict[str, Any], tolerance: float) -> Dict[str, Any]:
     """
-    Best-effort recompute of a single leaf:
-      - Loads model + backend;
-      - If possible, *assumes model currently at pre_commit* (we do not time-travel weights);
-      - Runs forward/backward/update for the batch described by leaf["batch"] deterministically;
-      - Compares post-commit within tolerance (if numeric weights & backend supports).
-    In MVP, when we cannot guarantee preimage restore, we return light checks.
+    Best-effort recompute of a single leaf; light audit if we cannot guarantee
+    exact preimage restoration (GPU nondeterminism tolerated).
     """
     out: Dict[str, Any] = {"notes": []}
     try:
@@ -333,10 +399,8 @@ def recompute_step(artifact_dir: str, job_spec: Dict[str, Any], leaf: Dict[str, 
         out["notes"].append(f"spec parse failed: {e!r}")
         return out
 
-    # determinism
     apply_determinism_profile(seed=spec.seed, allow_tf32=bool(spec.allow_tf32))
 
-    # load model + backend
     try:
         model, _ = _load_artifact_model(artifact_dir)
         backend = _resolve_backend(model)
@@ -344,7 +408,6 @@ def recompute_step(artifact_dir: str, job_spec: Dict[str, Any], leaf: Dict[str, 
         out["notes"].append(f"load model/backend failed: {e!r}")
         return out
 
-    # baseline commits (what we have *now*)
     try:
         current_commit = backend.weight_commit_hex()
     except Exception:
@@ -358,27 +421,26 @@ def recompute_step(artifact_dir: str, job_spec: Dict[str, Any], leaf: Dict[str, 
         out["notes"].append("cannot guarantee preimage restore; treating as light audit")
 
     # dataset batch reconstruction (best effort)
+    batch = None
     try:
-        ds_spec = DatasetSpec.from_dict(spec.dataset)
-        dset = open_dataset(ds_spec, seed=spec.seed)
-        batch_meta = leaf.get("batch") or {}
-        batch = dset.batch_from_meta(batch_meta)
+        if spec.dataset:
+            ds_spec = DatasetSpec.from_dict(spec.dataset)  # type: ignore[attr-defined]
+            dset = open_dataset(ds_spec, seed=spec.seed)
+            batch = dset.batch_from_meta(leaf.get("batch") or {})
     except Exception as e:
         out["notes"].append(f"batch reconstruction failed: {e!r}")
-        batch = None
 
-    # If we can proceed, run a single step
     if batch is not None:
         try:
             lr = float(spec.optimizer.get("lr", 1e-3))
-            info = backend.train_step(batch, lr, None)
-            # compute new commit
+            backend.train_step(batch, lr, None)
             new_commit = backend.weight_commit_hex()
             out["post_commit_ok"] = (post_c is None) or (new_commit == post_c)
             out["max_abs"] = float(0.0)
             out["max_rel"] = float(0.0)
         except Exception as e:
             out["notes"].append(f"backend train_step failed: {e!r}")
+            out["post_commit_ok"] = False
     else:
         out["post_commit_ok"] = False
 

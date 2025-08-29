@@ -2,16 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
-from ..utils.json_canon import dumps_canonical
-from ..utils.hashing import sha256_hex, sha256_domain, sha256_domain_hex
-from ..utils.merkle import merkle_root as _merkle_root_bytes
+from ..utils.json_canon import dumps_canon
+from ..utils.hashing import sha256_domain, sha256_domain_hex  # wrappers -> (data, domain)
+from ..utils.merkle import merkle_root_hex
 from ..utils.iohelpers import write_text_atomic
 
-# Domains: keep aligned with on-chain/C constants naming style
-_TRANSCRIPT_LEAF_DOMAIN  = b"ARK/TRAIN/LEAF/v1\n"
-_TRANSCRIPT_MERKLE_DOMAIN = b"ARK/TRAIN/MERKLE/v1\n"
+# Domains (aligned with C/on-chain naming style; include trailing '\n')
+_TRANSCRIPT_LEAF_DOMAIN: bytes   = b"ARK/TRAIN/LEAF/v1\n"
+_TRANSCRIPT_MERKLE_DOMAIN: bytes = b"ARK/TRAIN/MERKLE/v1\n"
 
 
 # ------------------------------ leaf model ---------------------------------
@@ -24,26 +24,26 @@ class TranscriptLeaf:
     domain-separated with _TRANSCRIPT_LEAF_DOMAIN.
     """
     type: str
-    step: int                   # global step/epoch counter as agreed by the recipe
+    step: int                   # global step counter as agreed by the recipe
     payload: Dict[str, Any]
 
     def preimage(self) -> bytes:
         """
-        Canonical preimage bytes for hashing the leaf.
-        Structure: canonical JSON of {"type", "step", "payload"} (stable key order),
-        then domain-separated SHA-256.
+        Canonical preimage bytes for hashing the leaf:
+        canonical JSON of {"type","step","payload"} (stable key order), UTF-8.
         """
         obj = {"type": self.type, "step": int(self.step), "payload": self.payload}
-        return dumps_canonical(obj)
+        return dumps_canon(obj).encode("utf-8")
 
     def leaf_hash(self) -> bytes:
-        return sha256_domain(_TRANSCRIPT_LEAF_DOMAIN, self.preimage())
+        # NOTE: sha256_domain takes (data, domain)
+        return sha256_domain(self.preimage(), _TRANSCRIPT_LEAF_DOMAIN)
 
     def hex(self) -> str:
-        return sha256_domain_hex(_TRANSCRIPT_LEAF_DOMAIN, self.preimage())
+        return sha256_domain_hex(self.preimage(), _TRANSCRIPT_LEAF_DOMAIN)
 
 
-# Convenience constructors for common leaf kinds -----------------------------
+# ---------------- convenience constructors ----------------------------------
 
 def leaf_batch(
     step: int,
@@ -80,8 +80,8 @@ def leaf_optimizer(step: int, optimizer_digest_hex: str, extra: Optional[Dict[st
 
 def leaf_export(step: int, weights_commit_hex: str, spec_hash_hex: str, extra: Optional[Dict[str, Any]] = None) -> TranscriptLeaf:
     """
-    Final (or periodic) exported weights checkpoint reference.
-    - weights_commit_hex: sha256 over .safetensors file (with export domain)
+    Exported weights checkpoint reference.
+    - weights_commit_hex: sha256 over .safetensors file (per export consensus)
     - spec_hash_hex: canonical training spec hash
     """
     payload: Dict[str, Any] = {"weights_commit": weights_commit_hex, "spec_hash": spec_hash_hex}
@@ -113,19 +113,22 @@ class TranscriptBuilder:
     def merkle_root_hex(self) -> str:
         if not self._leaves:
             # Merkle of empty list — define as hash(domain || "EMPTY")
-            return sha256_domain_hex(_TRANSCRIPT_MERKLE_DOMAIN, b"EMPTY")
+            return sha256_domain_hex(b"EMPTY", _TRANSCRIPT_MERKLE_DOMAIN)
         leaf_hashes = [lf.leaf_hash() for lf in self._leaves]
-        root = _merkle_root_bytes(leaf_hashes, domain=_TRANSCRIPT_MERKLE_DOMAIN)
-        return root.hex()
+        # Domain-separate the tree root as well
+        return merkle_root_hex(leaf_hashes, domain=_TRANSCRIPT_MERKLE_DOMAIN)
 
     def to_jsonl(self) -> str:
         """
-        Deterministic JSONL: each line is canonical JSON of the leaf object
-        (the same bytes used as leaf preimages).
+        Deterministic JSONL: each line is canonical JSON (same content as preimage),
+        one line per leaf, in order.
         """
-        lines = [dumps_canonical({"type": lf.type, "step": lf.step, "payload": lf.payload}).decode("utf-8")
-                 for lf in self._leaves]
-        return "\n".join(lines) + ("\n" if lines else "")
+        lines = [
+            dumps_canon({"type": lf.type, "step": int(lf.step), "payload": lf.payload})
+            for lf in self._leaves
+        ]
+        # dumps_canon returns str
+        return ("\n".join(lines) + "\n") if lines else ""
 
     def write_jsonl(self, path: str) -> None:
         write_text_atomic(path, self.to_jsonl())
@@ -139,4 +142,4 @@ def verify_transcript_merkle(
 ) -> bool:
     tb = TranscriptBuilder()
     tb.extend(leaves)
-    return tb.merkle_root_hex().lower() == expected_root_hex.lower()
+    return tb.merkle_root_hex().lower() == (expected_root_hex or "").strip().lower()

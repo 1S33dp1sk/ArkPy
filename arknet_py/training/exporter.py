@@ -1,190 +1,269 @@
-# training/exporter.py — canonical weight export (FP16 RNE) → .safetensors
+# arknet_py/training/exporter.py
+"""
+Canonical weight export (safetensors) and weight commit helpers.
+
+Consensus rule (defaults; overridable):
+- Float tensors are bucketized BEFORE export:
+  * mode="fp16_rne"  -> cast to IEEE-754 float16 (round-to-nearest-even)
+  * mode="grid"      -> snap to a uniform grid with step `grid_eps` (float32)
+
+Why: this collapses tiny GPU/parallelism-induced numeric drift so that the
+exported bytes – and therefore the commit hash – are stable across hardware.
+
+Public API:
+- export_safetensors(out_path, tensors=None, *, bucket_mode=None, grid_eps=None)
+    Writes a valid .safetensors file. If `tensors` is falsy, writes a
+    deterministic empty archive (header-only).
+
+- weight_commit_hex(tensors=None, *, path=None, bucket_mode=None, grid_eps=None) -> str
+    Returns sha256 hex of the canonical safetensors bytes (if `tensors`
+    provided) or of the file at `path` (if provided).
+
+- tensors_to_safetensors_bytes(tensors, *, bucket_mode=None, grid_eps=None) -> bytes
+    Build canonical safetensors bytes from a name->ndarray/array-like dict.
+
+Format emitted:
+  <u64 little-endian header_len> <header_json_bytes> <raw_tensor_bytes...>
+
+Header JSON is canonicalized (sorted keys, compact) via utils.json_canon.dumps_canon.
+"""
+
 from __future__ import annotations
 
-import os
-from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+import struct
+from typing import Any, Dict, Optional, Tuple
 
-from ..utils.hashing import sha256_hex, sha256_domain_hex
-from ..utils.iohelpers import ensure_parent_dir
-from ..utils.json_canon import dumps_canonical
-
-# We prefer numpy backend for explicit FP16 conversion (RNE via NumPy)
-try:
-    import numpy as np  # type: ignore
-except Exception as e:  # pragma: no cover
-    np = None  # type: ignore
-
-# Support both numpy and torch interfaces for safetensors
-try:
-    from safetensors.numpy import save_file as save_file_np  # type: ignore
-except Exception:  # pragma: no cover
-    save_file_np = None  # type: ignore
-
-try:
-    import torch  # type: ignore
-    from safetensors.torch import save_file as save_file_torch  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-    save_file_torch = None  # type: ignore
-
-
-# ------------------------------ config / metadata ---------------------------
-
-_EXPORT_DOMAIN = b"ARK/MODEL/EXPORT/v1\n"  # domain tag for file-level hash
-
-DEFAULT_EXCLUDE_SUBSTR = (
-    "num_batches_tracked",     # common BatchNorm counter
-    "_non_persistent_buffers", # PyTorch impl detail
+from ..utils.json_canon import dumps_canon
+from ..utils.hashing import sha256_hex
+from ..utils.iohelpers import atomic_write
+from ..constants import (
+    BUCKET_MODE_DEFAULT,
+    BUCKET_MODE_FP16_RNE,
+    BUCKET_MODE_GRID,
+    GRID_EPS_DEFAULT,
 )
 
-@dataclass(frozen=True)
-class ExportResult:
-    path: str
-    size_bytes: int
-    sha256: str             # hash over the final .safetensors bytes (domain separated)
-    n_tensors: int
-    keys: Tuple[str, ...]   # sorted keys
-    meta_json: str          # canonical JSON metadata used in file
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # Export of real tensors requires NumPy; empty archives still work.
 
 
-# ------------------------------ helpers ------------------------------------
+__all__ = [
+    "export_safetensors",
+    "weight_commit_hex",
+    "tensors_to_safetensors_bytes",
+]
 
-def _to_numpy_fp16(x) -> "np.ndarray":
+
+# ---------------- dtype & normalization helpers -----------------------------
+
+def _dtype_code(arr) -> str:
     """
-    Convert a tensor/array to contiguous NumPy float16 on CPU using
-    IEEE-754 round-to-nearest-even (NumPy does that by default).
+    Map numpy dtype -> safetensors dtype code.
     """
     if np is None:
-        raise RuntimeError("NumPy is required for canonical FP16 export")
+        raise TypeError("NumPy is required to export tensors; install numpy")
 
-    # torch.Tensor → numpy
-    if torch is not None and isinstance(x, torch.Tensor):  # type: ignore[misc]
-        with torch.no_grad():  # type: ignore[union-attr]
-            arr = x.detach().cpu().contiguous().numpy()
-        return arr.astype(np.float16, copy=False)  # RNE via NumPy
-    # numpy → numpy
-    if isinstance(x, np.ndarray):
-        return x.astype(np.float16, copy=False)
-    # Python scalar?
-    raise TypeError(f"Unsupported tensor type for export: {type(x)}")
-
-
-def _filter_state_dict(
-    state_dict: Dict[str, object],
-    exclude_substrings: Iterable[str],
-) -> Dict[str, object]:
-    excl = tuple(exclude_substrings or ())
-    out = {}
-    for k, v in state_dict.items():
-        if any(s in k for s in excl):
-            continue
-        out[k] = v
-    return out
-
-
-def _sorted_keys(d: Dict[str, object]) -> List[str]:
-    ks = list(d.keys())
-    ks.sort()
-    return ks
-
-
-def _stable_metadata(manifest: Dict[str, object]) -> Dict[str, str]:
-    """
-    Deterministic metadata for safetensors:
-      - JSON-canonicalize the manifest we embed
-      - store only a single key "arknet_meta" with canonical JSON text
-    """
-    j = dumps_canonical(manifest).decode("utf-8")
-    return {"arknet_meta": j}
+    dt = np.dtype(arr.dtype)
+    if dt == np.float16:
+        return "F16"
+    if dt == np.float32:
+        return "F32"
+    if dt == np.float64:
+        return "F64"
+    # BF16 if available
+    try:
+        if dt == np.dtype("bfloat16"):
+            return "BF16"
+    except Exception:
+        pass
+    if dt == np.int8:
+        return "I8"
+    if dt == np.int16:
+        return "I16"
+    if dt == np.int32:
+        return "I32"
+    if dt == np.int64:
+        return "I64"
+    if dt == np.uint8:
+        return "U8"
+    if dt == np.uint16:
+        return "U16"
+    if dt == np.uint32:
+        return "U32"
+    if dt == np.uint64:
+        return "U64"
+    if dt == np.bool_:
+        return "BOOL"
+    raise TypeError(f"unsupported dtype for safetensors: {dt!r}")
 
 
-def _state_dict_from_model(model) -> Dict[str, object]:
-    if torch is None:
-        raise RuntimeError("PyTorch not available; pass a state_dict instead of a model")
-    if not hasattr(model, "state_dict"):
-        raise TypeError("model has no .state_dict()")
-    sd = model.state_dict()
-    # Eagerly materialize to plain dict (avoid weight sharing views surprises)
-    return {k: v.clone().detach() if isinstance(v, torch.Tensor) else v for k, v in sd.items()}
+def _ensure_le_c_contig(a: "np.ndarray") -> "np.ndarray":
+    """Ensure little-endian, C-contiguous array (copy if needed)."""
+    if not a.flags.c_contiguous:
+        a = np.ascontiguousarray(a)
+    if a.dtype.byteorder == ">" or (a.dtype.byteorder == "=" and not np.little_endian):
+        a = a.byteswap().newbyteorder("<")
+    return a
 
 
-# ------------------------------ public API ---------------------------------
-
-def export_state_dict_to_safetensors(
-    state_dict: Dict[str, object],
-    out_path: str,
+def _bucketize_array(
+    x,
     *,
-    exclude_substrings: Iterable[str] = DEFAULT_EXCLUDE_SUBSTR,
-    extra_manifest: Optional[Dict[str, object]] = None,
-) -> ExportResult:
+    bucket_mode: Optional[str],
+    grid_eps: Optional[float],
+) -> "np.ndarray":
     """
-    Canonical export:
-      1) filter keys (exclude_substrings)
-      2) sort keys lexicographically
-      3) convert each tensor → FP16 (RNE) NumPy array
-      4) write .safetensors with deterministic metadata
-      5) hash the resulting bytes with domain separation
+    Apply consensus bucketization to float arrays; leave non-floats unchanged.
+
+    - bucket_mode="fp16_rne": cast to float16 (NumPy uses RNE for cast)
+    - bucket_mode="grid":     round to nearest multiple of grid_eps in float32
+    - bucket_mode=None:       use BUCKET_MODE_DEFAULT
     """
-    if np is None or save_file_np is None:
-        raise RuntimeError("safetensors[numpy] and NumPy are required for canonical export")
+    if np is None:
+        raise TypeError("NumPy is required to export tensors; install numpy")
 
-    filtered = _filter_state_dict(state_dict, exclude_substrings)
-    keys = _sorted_keys(filtered)
+    mode = bucket_mode or BUCKET_MODE_DEFAULT
+    eps = GRID_EPS_DEFAULT if grid_eps is None else float(grid_eps)
 
-    # Build ordered mapping of numpy arrays
-    arrays: "OrderedDict[str, np.ndarray]" = OrderedDict()
-    shapes_manifest = {}
-    dtypes_manifest = {}
+    a = x if isinstance(x, np.ndarray) else np.array(x)
+    kind = np.dtype(a.dtype).kind
 
-    for k in keys:
-        arr = _to_numpy_fp16(filtered[k])
-        arrays[k] = arr
-        shapes_manifest[k] = tuple(int(x) for x in arr.shape)
-        dtypes_manifest[k] = "float16"
+    if kind != "f":
+        # ints/uints/bool: keep as-is (but normalize layout/endianness)
+        return _ensure_le_c_contig(a)
 
-    manifest: Dict[str, object] = {
-        "format": "safetensors",
-        "dtype": "float16",
-        "shapes": shapes_manifest,
-        "keys": keys,
-        "arknet_export_version": 1,
-    }
-    if extra_manifest:
-        manifest["extra"] = extra_manifest
+    if mode == BUCKET_MODE_FP16_RNE:
+        # Cast to float16 (RNE). Keep as float16 to make bytes canonical.
+        a16 = a.astype(np.float16, copy=False)
+        return _ensure_le_c_contig(a16)
 
-    meta = _stable_metadata(manifest)
+    if mode == BUCKET_MODE_GRID:
+        if eps <= 0.0 or not np.isfinite(eps):
+            raise ValueError(f"grid_eps must be positive finite, got {eps}")
+        # Work in float32 for stable bytes; bankers rounding (ties to even)
+        a32 = a.astype(np.float32, copy=False)
+        snapped = np.rint(a32 / eps) * eps
+        snapped = snapped.astype(np.float32, copy=False)
+        return _ensure_le_c_contig(snapped)
 
-    ensure_parent_dir(out_path)
-    # Save deterministically (save_file_np respects dict insertion order)
-    save_file_np(arrays, out_path, metadata=meta)
-
-    # Read back file bytes to hash (domain-separated)
-    with open(out_path, "rb") as f:
-        data = f.read()
-    digest = sha256_domain_hex(_EXPORT_DOMAIN, data)
-    return ExportResult(
-        path=out_path,
-        size_bytes=len(data),
-        sha256=digest,
-        n_tensors=len(keys),
-        keys=tuple(keys),
-        meta_json=meta["arknet_meta"],
-    )
+    raise ValueError(f"unknown bucket_mode: {mode!r}")
 
 
-def export_model_to_safetensors(
-    model,
-    out_path: str,
+# ---------------- core building blocks --------------------------------------
+
+def _build_header_and_body(
+    tensors: Dict[str, Any],
     *,
-    exclude_substrings: Iterable[str] = DEFAULT_EXCLUDE_SUBSTR,
-    extra_manifest: Optional[Dict[str, object]] = None,
-) -> ExportResult:
+    bucket_mode: Optional[str],
+    grid_eps: Optional[float],
+) -> Tuple[bytes, bytes]:
     """
-    Convenience wrapper: pull state_dict from a torch model and export it.
+    Produce (<header_prefix+json>, <raw_concat_bytes>) for safetensors.
+    Header prefix is 8-byte LE length as per spec. Tensor names are sorted.
     """
-    sd = _state_dict_from_model(model)
-    return export_state_dict_to_safetensors(
-        sd, out_path, exclude_substrings=exclude_substrings, extra_manifest=extra_manifest
+    if not tensors:
+        hdr_json = dumps_canon({}).encode("utf-8")
+        return struct.pack("<Q", len(hdr_json)) + hdr_json, b""
+
+    names = sorted(tensors.keys())
+    np_tensors: Dict[str, "np.ndarray"] = {}
+
+    if np is None:
+        raise TypeError("NumPy is required to export tensors; install numpy")
+
+    # Normalize + bucketize per-tensor
+    for name in names:
+        np_tensors[name] = _bucketize_array(
+            tensors[name],
+            bucket_mode=bucket_mode,
+            grid_eps=grid_eps,
+        )
+
+    # Build header and concatenate body bytes in order
+    offset = 0
+    header: Dict[str, Any] = {}
+    body_parts = []
+    for name in names:
+        a = np_tensors[name]
+        a = _ensure_le_c_contig(a)
+        code = _dtype_code(a)
+        nbytes = int(a.nbytes)
+        header[name] = {
+            "dtype": code,
+            "shape": [int(d) for d in a.shape],
+            "data_offsets": [offset, offset + nbytes],
+        }
+        body_parts.append(a.tobytes(order="C"))
+        offset += nbytes
+
+    hdr_json = dumps_canon(header).encode("utf-8")
+    hdr_prefix = struct.pack("<Q", len(hdr_json))
+    body = b"".join(body_parts)
+    return hdr_prefix + hdr_json, body
+
+
+def tensors_to_safetensors_bytes(
+    tensors: Optional[Dict[str, Any]],
+    *,
+    bucket_mode: Optional[str] = None,
+    grid_eps: Optional[float] = None,
+) -> bytes:
+    """
+    Return full .safetensors bytes for a dict of name->array-like.
+    If tensors is falsy, returns a valid empty-archive safetensors.
+    """
+    hdr, body = _build_header_and_body(tensors or {}, bucket_mode=bucket_mode, grid_eps=grid_eps)
+    return hdr + body
+
+
+# ---------------- public API -------------------------------------------------
+
+def export_safetensors(
+    out_path: str,
+    tensors: Optional[Dict[str, Any]] = None,
+    *,
+    bucket_mode: Optional[str] = None,
+    grid_eps: Optional[float] = None,
+) -> None:
+    """
+    Write a canonical .safetensors file.
+
+    Args:
+      out_path: destination path
+      tensors:  dict of name->array-like; if falsy, writes empty archive
+      bucket_mode: "fp16_rne" (default) or "grid"
+      grid_eps: grid step for bucket_mode="grid" (default from constants)
+    """
+    data = tensors_to_safetensors_bytes(
+        tensors or {},
+        bucket_mode=bucket_mode,
+        grid_eps=grid_eps,
     )
+    atomic_write(out_path, data, binary=True)
+
+
+def weight_commit_hex(
+    tensors: Optional[Dict[str, Any]] = None,
+    *,
+    path: Optional[str] = None,
+    bucket_mode: Optional[str] = None,
+    grid_eps: Optional[float] = None,
+) -> str:
+    """
+    Produce a sha256 hex for weights either from:
+      - a live tensor dict (canonical, bucketized safetensors first), or
+      - an existing .safetensors file (`path`).
+    """
+    if path is not None:
+        # Hash file bytes directly (assumed already bucketized per consensus)
+        from ..utils.iohelpers import read_bytes  # local import to avoid cycles
+        return sha256_hex(read_bytes(path))
+
+    data = tensors_to_safetensors_bytes(
+        tensors or {},
+        bucket_mode=bucket_mode,
+        grid_eps=grid_eps,
+    )
+    return sha256_hex(data)

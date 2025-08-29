@@ -1,12 +1,14 @@
-# hashing.py — SHA-256 helpers, domain-tagged hashes, hex utils
+# arknet_py/utils/hashing.py — SHA-256 helpers, domain-tagged hashes, hex utils
 from __future__ import annotations
 
 import hashlib
-from typing import Iterable, Optional, Union
+from typing import Iterable, Union
 
 __all__ = [
-    "sha256", "sha256_hex", "sha256_stream",
-    "sha256_multi", "domain_hash", "domain_hash_hex",
+    "sha256", "sha256_hex", "sha256_stream", "sha256_multi",
+    "domain_hash", "domain_hash_hex",
+    # Compatibility wrappers expected by other modules:
+    "sha256_domain", "sha256_domain_hex",
     "hex_to_bytes", "bytes_to_hex",
 ]
 
@@ -16,7 +18,7 @@ BytesLike = Union[bytes, bytearray, memoryview]
 def sha256(data: BytesLike) -> bytes:
     """Return raw 32-byte SHA-256 digest of data."""
     h = hashlib.sha256()
-    h.update(data)
+    h.update(bytes(data))
     return h.digest()
 
 
@@ -29,7 +31,7 @@ def sha256_stream(chunks: Iterable[BytesLike]) -> bytes:
     """SHA-256 over an iterator of chunks."""
     h = hashlib.sha256()
     for c in chunks:
-        h.update(c)
+        h.update(bytes(c))
     return h.digest()
 
 
@@ -37,7 +39,7 @@ def sha256_multi(*parts: BytesLike) -> bytes:
     """SHA-256 over multiple parts (in-order)."""
     h = hashlib.sha256()
     for p in parts:
-        h.update(p)
+        h.update(bytes(p))
     return h.digest()
 
 
@@ -57,7 +59,7 @@ def _normalize_domain(dom: Union[str, bytes]) -> bytes:
 def domain_hash(data: BytesLike, domain: Union[str, bytes]) -> bytes:
     """
     Domain-tagged SHA-256: H( domain||data ), where domain ends with '\\n'.
-    Keep this aligned with the C implementation to ensure cross-language parity.
+    Keep this aligned cross-language.
     """
     tag = _normalize_domain(domain)
     return sha256_multi(tag, bytes(data))
@@ -68,14 +70,32 @@ def domain_hash_hex(data: BytesLike, domain: Union[str, bytes]) -> str:
     return domain_hash(data, domain).hex()
 
 
+# --------- Compatibility wrappers (used by other modules) ------------------
+
+def sha256_domain(data: BytesLike, domain: Union[str, bytes]) -> bytes:
+    """Alias of domain_hash(data, domain)."""
+    return domain_hash(data, domain)
+
+
+def sha256_domain_hex(domain: Union[str, bytes], data: BytesLike, raw: bool = False):
+    """
+    Compatibility signature: (domain, data, raw=False)
+    - If raw=False (default): return hex string (len 64)
+    - If raw=True: return raw 32-byte digest
+    """
+    d = domain_hash(data, domain)
+    return d if raw else d.hex()
+
+
+# --------- Hex helpers -----------------------------------------------------
+
 def hex_to_bytes(hx: str) -> bytes:
     """Lenient lower/upper hex → bytes; raises ValueError on bad input."""
-    hx = hx.strip()
-    if hx.startswith(("0x", "0X")):
-        hx = hx[2:]
-    # even length enforced by fromhex
+    s = hx.strip()
+    if s.startswith(("0x", "0X")):
+        s = s[2:]
     try:
-        return bytes.fromhex(hx)
+        return bytes.fromhex(s)
     except ValueError as e:
         raise ValueError(f"invalid hex: {e}") from e
 

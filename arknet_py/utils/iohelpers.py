@@ -1,26 +1,49 @@
-# iohelpers.py — small, safe, deterministic file helpers
+# arknet_py/utils/iohelpers.py — small, safe, deterministic file helpers
 from __future__ import annotations
 
-import io
 import os
 import tempfile
-from typing import Iterable, Optional
+from typing import Optional, Union
 
 __all__ = [
     "read_bytes",
     "read_text",
     "write_bytes_atomic",
     "write_text_atomic",
+    "atomic_write",
     "mkdirs",
+    "ensure_dir",
+    "ensure_parent_dir",
     "file_sha256",
 ]
 
 _CHUNK = 1024 * 1024  # 1 MiB
+BytesLike = Union[bytes, bytearray, memoryview]
 
 
 def mkdirs(path: str) -> None:
     """mkdir -p path"""
     os.makedirs(path, exist_ok=True)
+
+
+# Alias used throughout the codebase
+def ensure_dir(path: str) -> None:
+    """Alias for mkdirs()."""
+    mkdirs(path)
+
+
+def ensure_parent_dir(path: str) -> str:
+    """
+    Ensure the parent directory of a file path exists.
+    Returns the resolved parent directory path.
+
+    Examples:
+      ensure_parent_dir("/tmp/foo/bar.txt")  -> ensures "/tmp/foo"
+      ensure_parent_dir("rel/dir/file.bin")  -> ensures "<cwd>/rel/dir"
+    """
+    parent = os.path.dirname(os.path.realpath(path)) or "."
+    mkdirs(parent)
+    return parent
 
 
 def _fsync_dir(path: str) -> None:
@@ -48,7 +71,7 @@ def read_text(path: str, encoding: str = "utf-8") -> str:
         return f.read()
 
 
-def write_bytes_atomic(path: str, data: bytes, mode: int = 0o644) -> None:
+def write_bytes_atomic(path: str, data: BytesLike, mode: int = 0o644) -> None:
     """
     Write bytes atomically:
       - create temp in same dir
@@ -56,12 +79,11 @@ def write_bytes_atomic(path: str, data: bytes, mode: int = 0o644) -> None:
       - rename over target
       - fsync directory
     """
-    d = os.path.dirname(os.path.realpath(path)) or "."
-    mkdirs(d)
+    d = ensure_parent_dir(path)
     fd, tmp = tempfile.mkstemp(prefix=".tmp.", dir=d)
     try:
         with os.fdopen(fd, "wb", closefd=True) as f:
-            f.write(data)
+            f.write(bytes(data))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)  # atomic on POSIX
@@ -80,8 +102,30 @@ def write_bytes_atomic(path: str, data: bytes, mode: int = 0o644) -> None:
 
 
 def write_text_atomic(path: str, text: str, encoding: str = "utf-8", mode: int = 0o644) -> None:
-    data = text.encode(encoding)
-    write_bytes_atomic(path, data, mode=mode)
+    write_bytes_atomic(path, text.encode(encoding), mode=mode)
+
+
+def atomic_write(
+    path: str,
+    data: Union[str, BytesLike],
+    *,
+    encoding: str = "utf-8",
+    mode: int = 0o644,
+    binary: Optional[bool] = None,  # compatibility kwarg (ignored for bytes)
+) -> None:
+    """
+    Convenience wrapper that dispatches to bytes/text atomic writers.
+    Accepts either bytes-like or str.
+
+    - If `data` is bytes-like, `binary` is ignored.
+    - If `data` is str and `binary=True`, we raise (to prevent accidental text→bytes misuse).
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        write_bytes_atomic(path, data, mode=mode)
+    else:
+        if binary:
+            raise ValueError("atomic_write: got text with binary=True (pass bytes instead)")
+        write_text_atomic(path, str(data), encoding=encoding, mode=mode)
 
 
 def file_sha256(path: str) -> bytes:
