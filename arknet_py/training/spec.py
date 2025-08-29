@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.json_canon import dumps_canon          # deterministic JSON string
-from ..utils.hashing import domain_hash_hex         # domain-separated SHA-256
+from ..utils.hashing import domain_hash_hex, sha256_domain_hex         # domain-separated SHA-256
 
 # Domain tag aligned with C constants style (ARK_DOM_TRAIN)
 _SPEC_DOMAIN = b"ARK/TRAIN/SPEC/v1\n"
@@ -258,11 +258,11 @@ class TrainingSpec:
     def spec_hash_hex(self) -> str:
         """
         Canonical spec hash (hex-64) with domain separation.
-        Uses the stable canonical JSON text as preimage.
         """
         self.validate()
         blob = dumps_canon(self.to_public_dict()).encode("utf-8")
-        return domain_hash_hex(blob, _SPEC_DOMAIN)
+        # IMPORTANT: domain first, then bytes
+        return sha256_domain_hex(b"ARK/TRAIN/SPEC/v1\n", blob)
 
 
 __all__ = ["TrainingSpec"]
