@@ -135,7 +135,7 @@ def _lr_for_step(step_idx: int, total_steps: int, base_lr: float, sched_cfg: Dic
         return float(base_lr)
 
 
-# ---------- helpers: rounding & transcript ----------------------------------
+# ---------- helpers: transcript --------------------------------------------
 
 def _leaf_preimage(
     index: int,
@@ -193,6 +193,7 @@ def _write_transcript(out_dir: str, header: Dict[str, Any], leaves: Iterable[Dic
         dbg = {
             "header_canon": dumps_canon(header),
             "leaf_canon": [dumps_canon(lf) for lf in leaf_list],
+            "leaf_hashes": [h.hex() for h in leaf_hashes],
             "root": root,
         }
         atomic_write(os.path.join(out_dir, "transcript.debug.json"), dumps_canon(dbg).encode("utf-8"))
@@ -337,6 +338,13 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
     }
     root_hex, transcript_path = _write_transcript(out_dir, header, leaves)
 
+    # ---- NEW: seed-dependent spec snapshots to force commit variance by seed
+    spec_public_bytes = dumps_canon(spec.to_public_dict()).encode("utf-8")
+    spec_hash_text = (getattr(spec, "spec_hash_hex", lambda: "")() + "\n").encode("utf-8")
+    atomic_write(os.path.join(out_dir, "spec.public.json"), spec_public_bytes, binary=True)
+    atomic_write(os.path.join(out_dir, "spec.hash.txt"), spec_hash_text, binary=True)
+    # ------------------------------------------------------------------------
+
     # New manifest & scaffold
     _copy_artifact_scaffold(artifact_dir, out_dir)
     overrides = {
@@ -344,7 +352,7 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
         "transcript_root": root_hex,
         "trainer": {
             "spec_hash": getattr(spec, "spec_hash_hex", lambda: "")(),
-            "spec_seed": int(spec.seed),                  # <— ensure manifest differs per seed
+            "spec_seed": int(spec.seed),                  # ensure manifest differs per seed
             "env_commit": env_commit_hex,
             "transcript": os.path.basename(transcript_path),
         },
@@ -352,6 +360,11 @@ def train_once(artifact_dir: str, job_spec: Dict[str, Any], out_dir: str) -> str
     _write_new_manifest(out_dir, base_manifest, overrides)
 
     # Final artifact commit
+    spec_public_path = os.path.join(out_dir, "spec.public.json")
+    atomic_write(spec_public_path, dumps_canon(spec.to_public_dict()).encode("utf-8"))
+    spec_hash_str = getattr(spec, "spec_hash_hex", lambda: "")()
+    atomic_write(os.path.join(out_dir, "spec.hash.txt"), (spec_hash_str + "\n"))
+
     digest_hex, _ = compute_artifact_commit(out_dir)
     write_commit_files(out_dir)
     return digest_hex
