@@ -1,0 +1,11 @@
+[project]
+name = "arknet-py"
+version = "0.1.0"
+description = "Arknet model runner, deterministic training hooks, and model-commit tools"
+requires-python = ">=3.9"
+dependencies = [
+  "typing-extensions>=4.8.0"
+]
+
+[project.scripts]
+arknet-py = "arknet_py.cli:main"

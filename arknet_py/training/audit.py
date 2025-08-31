@@ -14,11 +14,15 @@ except Exception:  # pragma: no cover
     np = None  # type: ignore
 
 from ..utils.json_canon import dumps_canon
-from ..utils.hashing import domain_hash_hex
+from ..utils.hashing import domain_hash, domain_hash_hex
+from ..utils.merkle import merkle_root_hex
 from ..determinism import apply_determinism_profile
 from ..commit import compute_commit as compute_artifact_commit
+from .spec import TrainingSpec
 
 _AUDIT_DOMAIN = b"ARK/AUDIT/REPORT/v1\n"
+_STEP_DOMAIN = b"ARK/TRAIN/STEP/v1\n"
+_TRANSCRIPT_DOMAIN = "ARK/TRAIN/TRANSCRIPT/v1"
 
 
 # --------------------------- datamodel --------------------------------------
@@ -42,6 +46,10 @@ class AuditReport:
     sampled: int
     seed: int
     tolerance: float
+    # global validations
+    domain_ok: bool
+    merkle_ok: bool
+    spec_hash_ok: bool
     samples: List[AuditSampleResult]
     overall_ok: bool
 
@@ -61,9 +69,9 @@ def _load_json(path: str) -> Dict[str, Any]:
 
 def _import_trainer_recompute(artifact_dir: str):
     """
-    If artifact contains trainer.py with a recompute_step() function exposing:
+    If artifact contains trainer.py with a recompute_step() function:
       recompute_step(artifact_dir:str, job_spec:dict, leaf:dict, tolerance:float) -> dict
-    we use it for deep audits (forward/backward/opt).
+    use it for deep audits (forward/backward/opt).
     """
     entry = os.path.join(artifact_dir, "trainer.py")
     if not os.path.exists(entry):
@@ -76,7 +84,13 @@ def _import_trainer_recompute(artifact_dir: str):
     return getattr(mod, "recompute_step", None)
 
 
-def _select_indices(n: int, k: int, seed: int) -> List[int]:
+def _select_indices(n: int, k: int, seed: int, *, kinds: Optional[List[str]] = None, leaves: Optional[List[Dict[str, Any]]] = None) -> List[int]:
+    if kinds and leaves is not None:
+        cand = [i for i, lf in enumerate(leaves) if str(lf.get("kind") or "") in kinds]
+        n = len(cand)
+        rng = random.Random(seed)
+        rng.shuffle(cand)
+        return sorted(cand[: max(0, min(k, n))])
     k = max(0, min(k, n))
     rng = random.Random(seed)
     idx = list(range(n))
@@ -102,6 +116,13 @@ def _drift_metrics(a: "np.ndarray", b: "np.ndarray") -> Tuple[float, float]:
     return (max_abs, max_rel)
 
 
+def _verify_transcript_merkle(tr: Dict[str, Any]) -> Tuple[bool, str]:
+    leaves = list(tr.get("leaves") or [])
+    leaf_hashes = [domain_hash(dumps_canon(lf).encode("utf-8"), _STEP_DOMAIN) for lf in leaves]
+    recomputed = merkle_root_hex(leaf_hashes)
+    return (str(recomputed) == str(tr.get("root")), recomputed)
+
+
 # ----------------------------- public API -----------------------------------
 
 def audit_transcript(
@@ -113,23 +134,10 @@ def audit_transcript(
     seed: int = 0,
     tolerance: float = 1e-6,
     apply_determinism: bool = True,
+    only_kinds: Optional[List[str]] = None,  # e.g., ["train_step"]
 ) -> AuditReport:
     """
     Recompute K sampled leaves from `transcript_path` using artifact’s trainer if available.
-
-    Transcript format (from new trainer):
-      {
-        "header": {
-          "spec": {...},
-          "parent_commit": "...",
-          "env_commit": "...",
-          "steps": N,
-          "dataset_commit": "..."
-        },
-        "leaves": [ { "kind":"train_step", "index":0, "pre_commit":..., "post_commit":..., "loss":..., "dataset_commit":..., "batch": {...}, "tags":[...] }, ... ],
-        "root": "...",
-        "domain": "ARK/TRAIN/TRANSCRIPT/v1"
-      }
 
     Deep audit path (if artifact trainer exposes recompute_step):
       - Calls trainer.recompute_step(artifact_dir, job_spec_dict, leaf_dict, tolerance)
@@ -154,14 +162,26 @@ def audit_transcript(
     else:
         job_spec = dict(header.get("spec") or {})
 
+    # Spec-hash parity (if TrainingSpec available)
+    try:
+        spec_obj = TrainingSpec.from_dict(job_spec)
+        spec_hash_expected = header.get("spec_hash")
+        spec_hash_ok = (spec_obj.spec_hash_hex() == spec_hash_expected) if spec_hash_expected else True
+    except Exception:
+        spec_hash_ok = False
+
     # Commit of the artifact currently on disk (should match header.parent_commit)
     artifact_commit_hex, _ = compute_artifact_commit(artifact_dir)
+
+    # Global transcript checks
+    domain_ok = (str(tr.get("domain") or "").strip() == _TRANSCRIPT_DOMAIN)
+    merkle_ok, _recomputed_root = _verify_transcript_merkle(tr)
 
     # Optional deep-audit hook from artifact
     recompute_step = _import_trainer_recompute(artifact_dir)
 
     # Which leaves to audit
-    chosen = _select_indices(total, k, seed)
+    chosen = _select_indices(total, k, seed, kinds=only_kinds, leaves=leaves)
 
     results: List[AuditSampleResult] = []
     for idx in chosen:
@@ -232,7 +252,7 @@ def audit_transcript(
             notes=notes,
         ))
 
-    overall_ok = all(r.ok for r in results)
+    overall_ok = (domain_ok and merkle_ok and spec_hash_ok and all(r.ok for r in results))
     rep = AuditReport(
         transcript_path=os.path.realpath(transcript_path),
         artifact_dir=os.path.realpath(artifact_dir),
@@ -241,6 +261,9 @@ def audit_transcript(
         sampled=len(results),
         seed=int(seed),
         tolerance=float(tolerance),
+        domain_ok=bool(domain_ok),
+        merkle_ok=bool(merkle_ok),
+        spec_hash_ok=bool(spec_hash_ok),
         samples=results,
         overall_ok=bool(overall_ok),
     )

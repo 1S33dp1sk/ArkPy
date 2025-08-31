@@ -81,17 +81,40 @@ def _collect_torch(allow_tf32: bool) -> Optional[TorchInfo]:
     version = getattr(torch, "__version__", None)
     cuda_ver = getattr(torch.version, "cuda", None) if hasattr(torch, "version") else None
 
+    # ---- cuDNN: coerce callables/objects → JSON primitives -------------------
     cudnn_info: Optional[Dict[str, Any]] = None
     try:
         if hasattr(torch.backends, "cudnn"):
+            cudnn = torch.backends.cudnn
+
+            def _bool(x):
+                try:
+                    return bool(x() if callable(x) else x)
+                except Exception:
+                    return None
+
+            def _int_or_none(x):
+                try:
+                    x = x() if callable(x) else x
+                    if isinstance(x, bool):
+                        return int(x)
+                    if isinstance(x, (int,)):
+                        return int(x)
+                    if isinstance(x, str) and x.isdigit():
+                        return int(x)
+                    return None
+                except Exception:
+                    return None
+
             cudnn_info = {
-                "enabled": bool(torch.backends.cudnn.enabled),
-                "version": getattr(torch.backends.cudnn, "version", None),
-                "deterministic": getattr(torch.backends.cudnn, "deterministic", None),
-                "benchmark": getattr(torch.backends.cudnn, "benchmark", None),
+                "enabled": _bool(getattr(cudnn, "enabled", None)),
+                "version": _int_or_none(getattr(cudnn, "version", None)),
+                "deterministic": _bool(getattr(cudnn, "deterministic", None)),
+                "benchmark": _bool(getattr(cudnn, "benchmark", None)),
             }
     except Exception:
         cudnn_info = None
+    # -------------------------------------------------------------------------
 
     gpus: List[GpuInfo] = []
     try:
@@ -101,13 +124,13 @@ def _collect_torch(allow_tf32: bool) -> Optional[TorchInfo]:
                     name = str(torch.cuda.get_device_name(i))
                 except Exception:
                     name = f"cuda:{i}"
-                capability: Optional[str] = None
+                capability = None
                 try:
                     maj, minr = torch.cuda.get_device_capability(i)
                     capability = f"{maj}.{minr}"
                 except Exception:
                     pass
-                mem_mb: Optional[int] = None
+                mem_mb = None
                 try:
                     props = torch.cuda.get_device_properties(i)
                     mem_mb = int(getattr(props, "total_memory", 0) // (1024 * 1024))
@@ -115,7 +138,6 @@ def _collect_torch(allow_tf32: bool) -> Optional[TorchInfo]:
                     pass
                 gpus.append(GpuInfo(name=name, capability=capability, total_memory_mb=mem_mb))
     except Exception:
-        # leave gpus empty
         pass
 
     return TorchInfo(
