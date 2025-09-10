@@ -1,0 +1,9 @@
+graft arknet_py
+recursive-include arknet_py *.py *.txt *.json *.bin *.cfg *.ini *.yaml *.yml
+recursive-exclude arknet_py __pycache__ *.py[cod]
+prune build
+prune dist
+prune wheelhouse
+prune scripts
+prune .venv*
+exclude *.egg-info/*

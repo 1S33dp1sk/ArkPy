@@ -1,11 +1,32 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "arknet-py"
 version = "0.1.0"
-description = "Arknet model runner, deterministic training hooks, and model-commit tools"
+description = "Arknet Python toolkit"
+readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [
-  "typing-extensions>=4.8.0"
+authors = [{ name = "Arknet" }]
+dependencies = []
+
+[tool.setuptools]
+# use explicit data lists; do NOT auto-include arbitrary dirs
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["arknet_py*"]
+exclude = ["*.__pycache__*", "arknet_py.__pycache__*", "tests*", "scripts*", "build*", "dist*", "wheelhouse*", ".venv*"]
+
+[tool.setuptools.package-data]
+arknet_py = [
+  "artifacts/**",
+  "training/**",
+  "backends/**",
+  "*.txt", "*.json", "*.bin", "*.cfg", "*.ini", "*.yaml", "*.yml"
 ]
 
-[project.scripts]
-arknet-py = "arknet_py.cli:main"
+[tool.setuptools.exclude-package-data]
+arknet_py = ["__pycache__/*", "*/__pycache__/*", "*.pyc", "*.pyo"]
