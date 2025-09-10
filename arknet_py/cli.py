@@ -2,20 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
-from typing import Any, Dict, List, Optional
-
-from .commit import (
-    compute_commit,
-    write_commit_files,
-    load_commit_manifest,
-    verify_commit,
-)
-from .runner import ArknetModel
-from .determinism import apply_determinism_profile, determinism_report
-from .training.trainer import train_once
-
+from typing import Any, Dict, List, Optional, Iterable
 
 # ------------------------------ utils -------------------------------------
 
@@ -28,7 +18,6 @@ def _load_json_from_path(path: str) -> Any:
 
 
 def _kv_list_to_dict(items: Optional[List[str]]) -> Dict[str, Any]:
-    """--param k=v (repeatable) → dict with best-effort JSON coercion."""
     out: Dict[str, Any] = {}
     if not items:
         return out
@@ -65,12 +54,12 @@ def _merge_params(args) -> Dict[str, Any]:
     return p
 
 
-def _print_stream(chunks) -> None:
+def _print_stream(chunks: Iterable[Any]) -> None:
     for ch in chunks:
-        if ch.text:
+        if getattr(ch, "text", None):
             print(ch.text, end="", flush=True)
     if sys.stdout.isatty():
-        print()  # nicety for TTYs
+        print()
 
 
 def _load_prompt(path: str) -> str:
@@ -84,6 +73,13 @@ def _load_prompt(path: str) -> str:
 
 
 def _cmd_commit(args) -> int:
+    from .commit import (
+        compute_commit,
+        write_commit_files,
+        load_commit_manifest,
+        verify_commit,
+    )
+
     if args.verify:
         ok = verify_commit(args.artifact, args.verify)
         print("OK" if ok else "MISMATCH")
@@ -99,13 +95,17 @@ def _cmd_commit(args) -> int:
 
 
 def _cmd_commit_show(args) -> int:
+    from .commit import load_commit_manifest
+
     mf = load_commit_manifest(args.artifact)
     print(json.dumps(mf, indent=2, sort_keys=True))
     return 0
 
 
 def _cmd_run(args) -> int:
-    # process-wide determinism (env + libs)
+    from .runner import ArknetModel
+    from .determinism import apply_determinism_profile
+
     if args.seed is not None or args.allow_tf32:
         apply_determinism_profile(seed=args.seed, allow_tf32=bool(args.allow_tf32))
 
@@ -132,13 +132,17 @@ def _cmd_run(args) -> int:
                 out = runner.generate(prompt, params=params, stream=False)
                 print(out)
         return 0
+    except KeyboardInterrupt:
+        return 130
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
 
 def _cmd_train(args) -> int:
-    # determinism profile for training (stronger parity)
+    from .determinism import apply_determinism_profile
+    from .training.trainer import train_once
+
     spec: Dict[str, Any] = {}
     if args.spec:
         spec = _load_json_from_path(args.spec)
@@ -155,18 +159,44 @@ def _cmd_train(args) -> int:
 
 
 def _cmd_env_report(_args) -> int:
+    from .determinism import determinism_report
+
     print(json.dumps(determinism_report(), indent=2, sort_keys=True))
     return 0
+
+
+def _cmd_serve(args) -> int:
+    from .serve import ServeConfig, run_server, DEFAULT_HOST, DEFAULT_PORT, REQ_TIMEOUT_S
+
+    host = DEFAULT_HOST if args.host is None else args.host
+    port = DEFAULT_PORT if args.port is None else args.port
+    req_timeout = REQ_TIMEOUT_S if args.req_timeout is None else args.req_timeout
+
+    cfg = ServeConfig(
+        host=host,
+        port=port,
+        uds=args.uds,
+        rt_module=args.rt_module,
+        artifact=args.artifact,
+        token=args.token,
+        max_inflight=args.max_inflight,
+        req_timeout_s=req_timeout,
+        allow_remote=bool(args.allow_remote),
+    )
+    try:
+        asyncio.run(run_server(cfg))
+        return 0
+    except KeyboardInterrupt:
+        return 130
 
 
 # ------------------------------ main ---------------------------------------
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     p = argparse.ArgumentParser(prog="arknet-py", description="Arknet model tooling")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # commit
     pc = sub.add_parser("commit", help="Compute/verify canonical model commit hash")
     pc.add_argument("artifact", help="Path to artifact directory")
     pc.add_argument("--write", action="store_true", help="Write commit.json (defaults to artifact dir)")
@@ -175,12 +205,10 @@ def main() -> None:
     pc.add_argument("--verify", metavar="HEX64", help="Verify the commit equals HEX64; exit 0/2")
     pc.set_defaults(func=_cmd_commit)
 
-    # commit.show (pretty print manifest/commit)
     pcs = sub.add_parser("commit.show", help="Show commit/manifest JSON (prefers commit.json)")
     pcs.add_argument("artifact", help="Path to artifact directory")
     pcs.set_defaults(func=_cmd_commit_show)
 
-    # run
     pr = sub.add_parser("run", help="Run inference (prompt or chat)")
     pr.add_argument("artifact", help="Path to artifact directory (or exported out_dir)")
     g_in = pr.add_mutually_exclusive_group(required=True)
@@ -195,7 +223,6 @@ def main() -> None:
     pr.add_argument("--stream", action="store_true", help="Stream tokens/chunks to stdout")
     pr.set_defaults(func=_cmd_run)
 
-    # train
     pt = sub.add_parser("train", help="Run deterministic training via trainer.py")
     pt.add_argument("artifact", help="Path to artifact directory containing trainer.py")
     pt.add_argument("--spec", help="JSON file (or '-') with job_spec (seed, datasets, recipe, etc.)")
@@ -204,13 +231,23 @@ def main() -> None:
     pt.add_argument("--allow-tf32", action="store_true", help="Allow TF32 during training (off by default)")
     pt.set_defaults(func=_cmd_train)
 
-    # env.report
     pe = sub.add_parser("env.report", help="Print determinism/environment report (JSON)")
     pe.set_defaults(func=_cmd_env_report)
 
-    args = p.parse_args()
+    ps = sub.add_parser("serve", help="Run RPC server for arkd ↔ ArkPy")
+    grp = ps.add_mutually_exclusive_group()
+    grp.add_argument("--host", help="Bind host (default from arknet_py.serve)")
+    grp.add_argument("--uds", help="Unix domain socket path")
+    ps.add_argument("--port", type=int, help="Port when using TCP (default from arknet_py.serve)")
+    ps.add_argument("--rt-module", default="arknet_py.rt", help="Module exposing train_step(state, batch) -> bytes")
+    ps.add_argument("--artifact", help="Artifact dir for healthz/commit reporting")
+    ps.add_argument("--token", help="Optional shared secret; client sends as 't'")
+    ps.add_argument("--max-inflight", type=int, default=64, help="Global concurrent requests")
+    ps.add_argument("--req-timeout", type=float, help="Per-request timeout (seconds, default from arknet_py.serve)")
+    ps.add_argument("--allow-remote", action="store_true", help="Allow non-localhost bind")
+    ps.set_defaults(func=_cmd_serve)
 
-    # --write-out implies --write
+    args = p.parse_args(argv)
     if getattr(args, "write_out", None):
         args.write = True
 
